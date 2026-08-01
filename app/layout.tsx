@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import "./enhancements.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://throwit.s41r4j.in"),
@@ -31,7 +30,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#f3f1ec",
+  themeColor: "#f4f2ed",
   colorScheme: "light",
 };
 
