@@ -9,15 +9,14 @@ export async function POST(request: NextRequest) {
   let space: string | null = null;
 
   try {
-    const body = (await request.json()) as
-      | Device
-      | { peer?: Device; space?: string | null };
-    if ("peer" in body) {
-      if (!body.peer) throw new Error("Missing peer");
-      peer = body.peer;
-      space = body.space || null;
+    const body = (await request.json()) as unknown;
+    if (body && typeof body === "object" && "peer" in body) {
+      const envelope = body as { peer?: Device; space?: string | null };
+      if (!envelope.peer) throw new Error("Missing peer");
+      peer = envelope.peer;
+      space = envelope.space || null;
     } else {
-      peer = body;
+      peer = body as Device;
     }
   } catch {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
