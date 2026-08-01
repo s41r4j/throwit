@@ -6,11 +6,16 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: NextRequest) {
   try {
-    const body = (await request.json()) as { from?: string; to?: string; signal?: unknown };
+    const body = (await request.json()) as {
+      from?: string;
+      to?: string;
+      signal?: unknown;
+      space?: string | null;
+    };
     if (!body.from || !body.to || !body.signal) {
       return NextResponse.json({ error: "Invalid signal" }, { status: 400 });
     }
-    await pushSignal(request.headers, body.from, body.to, body.signal);
+    await pushSignal(request.headers, body.from, body.to, body.signal, body.space);
     return NextResponse.json({ ok: true });
   } catch (error) {
     return NextResponse.json(
@@ -22,9 +27,10 @@ export async function POST(request: NextRequest) {
 
 export async function GET(request: NextRequest) {
   const peer = request.nextUrl.searchParams.get("peer") || "";
+  const space = request.nextUrl.searchParams.get("space");
   if (!peer) return NextResponse.json({ signals: [] });
   try {
-    const signals = await pullSignals(request.headers, peer);
+    const signals = await pullSignals(request.headers, peer, space);
     return NextResponse.json({ signals }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return NextResponse.json(
