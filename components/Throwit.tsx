@@ -30,7 +30,7 @@ function identity(): Device {
 }
 
 export default function Throwit() {
-  const [self, setSelf] = useState<Device | null>(null);
+  const [self] = useState<Device | null>(() => typeof window === "undefined" ? null : identity());
   const [peers, setPeers] = useState<Device[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [status, setStatus] = useState("Preparing local airspace");
@@ -49,11 +49,12 @@ export default function Throwit() {
   const pendingIce = useRef(new Map<string, RTCIceCandidateInit[]>());
   const outgoing = useRef(new Map<string, { peer: string; file: File }>());
   const incoming = useRef(new Map<string, Incoming>());
+  const fileUrls = useRef(new Set<string>());
   const input = useRef<HTMLInputElement | null>(null);
 
   const chosen = useMemo(() => peers.find((p) => p.id === selected) || null, [peers, selected]);
-  const thread = chat.filter((m) => m.peer === selected);
-  const received = files.filter((f) => f.peer === selected);
+  const thread = chat.filter((message) => message.peer === selected);
+  const received = files.filter((file) => file.peer === selected);
   const selectedIndex = Math.max(0, peers.findIndex((peer) => peer.id === selected));
 
   const toast = useCallback((message: string) => {
@@ -93,7 +94,12 @@ export default function Throwit() {
 
   const connect = useCallback((peer: string, initiator: boolean) => {
     if (pcs.current.has(peer)) return pcs.current.get(peer)!;
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }] });
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
+      ],
+    });
     pcs.current.set(peer, pc);
     pc.onicecandidate = ({ candidate }) => candidate && void signal(peer, { candidate: candidate.toJSON() });
     pc.ondatachannel = ({ channel }) => bind(peer, channel);
@@ -129,6 +135,39 @@ export default function Throwit() {
     }
   }, [connect, signal]);
 
+  const waitChannel = useCallback(async (peer: string) => {
+    const current = channels.current.get(peer);
+    if (current?.readyState === "open") return current;
+    connect(peer, true);
+    return new Promise<RTCDataChannel>((resolve, reject) => {
+      const started = Date.now();
+      const timer = window.setInterval(() => {
+        const channel = channels.current.get(peer);
+        if (channel?.readyState === "open") {
+          clearInterval(timer);
+          resolve(channel);
+        } else if (Date.now() - started > 15000) {
+          clearInterval(timer);
+          reject(new Error("timeout"));
+        }
+      }, 120);
+    });
+  }, [connect]);
+
+  const sendFileBytes = useCallback(async (peer: string, id: string, file: File) => {
+    const channel = await waitChannel(peer);
+    setProgress({ name: file.name, value: 0 });
+    for (let offset = 0; offset < file.size; offset += CHUNK) {
+      while (channel.bufferedAmount > 4 * 1024 * 1024) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
+      setProgress({ name: file.name, value: Math.round(Math.min(file.size, offset + CHUNK) / file.size * 100) });
+    }
+    sendWire(peer, { type: "end", id });
+    window.setTimeout(() => setProgress(null), 900);
+  }, [sendWire, waitChannel]);
+
   const handleData = useCallback((peer: string, event: MessageEvent) => {
     if (event.data instanceof ArrayBuffer) {
       const transfer = incoming.current.get(peer);
@@ -138,10 +177,20 @@ export default function Throwit() {
       setProgress({ name: transfer.name, value: Math.min(99, Math.round(transfer.received / transfer.size * 100)) });
       return;
     }
+
     let message: Wire;
-    try { message = JSON.parse(String(event.data)) as Wire; } catch { return; }
-    if (message.type === "text") setChat((items) => [...items, { id: message.id, peer, mine: false, text: message.text }]);
-    if (message.type === "file") setOffer({ peer, id: message.id, name: message.name, size: message.size, mime: message.mime });
+    try {
+      message = JSON.parse(String(event.data)) as Wire;
+    } catch {
+      return;
+    }
+
+    if (message.type === "text") {
+      setChat((items) => [...items, { id: message.id, peer, mine: false, text: message.text }]);
+    }
+    if (message.type === "file") {
+      setOffer({ peer, id: message.id, name: message.name, size: message.size, mime: message.mime });
+    }
     if (message.type === "accept") {
       const item = outgoing.current.get(message.id);
       if (!item) return;
@@ -153,57 +202,34 @@ export default function Throwit() {
       const item = incoming.current.get(peer);
       if (!item || item.id !== message.id) return;
       const url = URL.createObjectURL(new Blob(item.chunks, { type: item.mime }));
+      fileUrls.current.add(url);
       setFiles((list) => [...list, { id: item.id, peer, name: item.name, size: item.size, url }]);
       incoming.current.delete(peer);
       setProgress(null);
       toast(`${item.name} was caught.`);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toast]);
+  }, [sendFileBytes, toast]);
 
   useEffect(() => {
-    channels.current.forEach((channel, peer) => { channel.onmessage = (event) => handleData(peer, event); });
+    const activeChannels = channels.current;
+    activeChannels.forEach((channel, peer) => {
+      channel.onmessage = (event) => handleData(peer, event);
+    });
   }, [handleData]);
 
-  const waitChannel = useCallback(async (peer: string) => {
-    const current = channels.current.get(peer);
-    if (current?.readyState === "open") return current;
-    connect(peer, true);
-    return new Promise<RTCDataChannel>((resolve, reject) => {
-      const started = Date.now();
-      const timer = window.setInterval(() => {
-        const channel = channels.current.get(peer);
-        if (channel?.readyState === "open") { clearInterval(timer); resolve(channel); }
-        else if (Date.now() - started > 15000) { clearInterval(timer); reject(new Error("timeout")); }
-      }, 120);
-    });
-  }, [connect]);
-
-  const sendFileBytes = useCallback(async (peer: string, id: string, file: File) => {
-    const channel = await waitChannel(peer);
-    setProgress({ name: file.name, value: 0 });
-    for (let offset = 0; offset < file.size; offset += CHUNK) {
-      while (channel.bufferedAmount > 4 * 1024 * 1024) await new Promise((resolve) => setTimeout(resolve, 25));
-      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
-      setProgress({ name: file.name, value: Math.round(Math.min(file.size, offset + CHUNK) / file.size * 100) });
-    }
-    sendWire(peer, { type: "end", id });
-    window.setTimeout(() => setProgress(null), 900);
-  }, [sendWire, waitChannel]);
-
   useEffect(() => {
-    const me = identity();
-    setSelf(me);
+    if (!self) return;
+
     let stopped = false;
-    let presenceTimer: number | undefined;
-    let signalTimer: number | undefined;
+    const peerConnections = pcs.current;
+    const createdFileUrls = fileUrls.current;
 
     const presence = async () => {
       try {
         const response = await fetch("/api/presence", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(me),
+          body: JSON.stringify(self),
           cache: "no-store",
         });
         const result = await response.json() as { peers?: Device[]; error?: string };
@@ -221,7 +247,7 @@ export default function Throwit() {
 
     const pollSignals = async () => {
       try {
-        const response = await fetch(`/api/signal?peer=${encodeURIComponent(me.id)}`, { cache: "no-store" });
+        const response = await fetch(`/api/signal?peer=${encodeURIComponent(self.id)}`, { cache: "no-store" });
         const result = await response.json() as { signals?: Array<{ from: string; signal: Signal }> };
         for (const item of result.signals || []) await receiveSignal(item.from, item.signal);
       } catch {
@@ -231,17 +257,18 @@ export default function Throwit() {
 
     void presence();
     void pollSignals();
-    presenceTimer = window.setInterval(() => void presence(), 2800);
-    signalTimer = window.setInterval(() => void pollSignals(), 650);
+    const presenceTimer = window.setInterval(() => void presence(), 2800);
+    const signalTimer = window.setInterval(() => void pollSignals(), 650);
+
     return () => {
       stopped = true;
-      if (presenceTimer) clearInterval(presenceTimer);
-      if (signalTimer) clearInterval(signalTimer);
-      pcs.current.forEach((pc) => pc.close());
-      files.forEach((file) => URL.revokeObjectURL(file.url));
+      clearInterval(presenceTimer);
+      clearInterval(signalTimer);
+      peerConnections.forEach((pc) => pc.close());
+      createdFileUrls.forEach((url) => URL.revokeObjectURL(url));
+      createdFileUrls.clear();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [receiveSignal]);
+  }, [receiveSignal, self]);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => handleData(selected || "", event);
@@ -261,12 +288,17 @@ export default function Throwit() {
       setChat((items) => [...items, { id, peer: chosen.id, mine: true, text: value }]);
       setText("");
       animateThrow();
-    } catch { toast("Could not reach that device."); }
+    } catch {
+      toast("Could not reach that device.");
+    }
   }
 
-  async function prepareFile(file?: File) {
+  function prepareFile(file?: File) {
     if (!file) return;
-    if (file.size > LIMIT) return toast("Files are limited to 512 MB.");
+    if (file.size > LIMIT) {
+      toast("Files are limited to 512 MB.");
+      return;
+    }
     setLoadedFile(file);
     setMode("file");
   }
@@ -278,10 +310,18 @@ export default function Throwit() {
       channel.onmessage = (message) => handleData(chosen.id, message);
       const id = uid();
       outgoing.current.set(id, { peer: chosen.id, file: loadedFile });
-      sendWire(chosen.id, { type: "file", id, name: loadedFile.name, size: loadedFile.size, mime: loadedFile.type || "application/octet-stream" });
+      sendWire(chosen.id, {
+        type: "file",
+        id,
+        name: loadedFile.name,
+        size: loadedFile.size,
+        mime: loadedFile.type || "application/octet-stream",
+      });
       animateThrow();
       toast(`Waiting for ${chosen.name} to catch it.`);
-    } catch { toast("Could not prepare the direct route."); }
+    } catch {
+      toast("Could not prepare the direct route.");
+    }
   }
 
   function animateThrow() {
@@ -293,7 +333,11 @@ export default function Throwit() {
   function answer(accepted: boolean) {
     if (!offer) return;
     if (accepted) incoming.current.set(offer.peer, { ...offer, chunks: [], received: 0 });
-    try { sendWire(offer.peer, { type: "accept", id: offer.id, accepted }); } catch { toast("The sender disconnected."); }
+    try {
+      sendWire(offer.peer, { type: "accept", id: offer.id, accepted });
+    } catch {
+      toast("The sender disconnected.");
+    }
     setOffer(null);
   }
 
@@ -319,7 +363,7 @@ export default function Throwit() {
         <div className="tabs"><button className={mode === "file" ? "active" : ""} onClick={() => setMode("file")}>File</button><button className={mode === "text" ? "active" : ""} onClick={() => setMode("text")}>Text</button></div>
         {mode === "file" ? <>
           <button className="payload" onClick={() => input.current?.click()} disabled={!chosen}><span>{loadedFile ? "↑" : "+"}</span><div><strong>{loadedFile?.name || "Choose a file"}</strong><small>{loadedFile ? bytes(loadedFile.size) : chosen ? `to ${chosen.name}` : "select a device first"}</small></div></button>
-          <input ref={input} hidden type="file" onChange={(event) => { void prepareFile(event.target.files?.[0]); event.target.value = ""; }} />
+          <input ref={input} hidden type="file" onChange={(event) => { prepareFile(event.target.files?.[0]); event.target.value = ""; }} />
           <button className="throw" disabled={!chosen || !loadedFile} onClick={() => void throwFile()}><span>→</span><strong>throw it</strong></button>
         </> : <div className="text-dock">
           <div className="thread">{!thread.length && !received.length && <p>Temporary chat with {chosen?.name || "a selected device"}.</p>}{thread.map((item) => <article key={item.id} className={item.mine ? "mine" : ""}>{item.text}<button onClick={() => navigator.clipboard.writeText(item.text)}>copy</button></article>)}{received.map((file) => <article key={file.id} className="received"><span>↓</span><div><strong>{file.name}</strong><small>{bytes(file.size)}</small></div><a href={file.url} download={file.name}>save</a></article>)}</div>
