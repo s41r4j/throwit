@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Throwit — local peer-to-peer transfer",
+  title: "Throwit",
   description: "Throw files and text directly to nearby devices.",
   applicationName: "Throwit",
   icons: {
