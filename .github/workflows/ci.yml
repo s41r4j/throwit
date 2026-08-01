@@ -1,16 +1,34 @@
 name: CI
+
 on:
   push:
   pull_request:
+
+# Prevent an older queued run from reporting against code that has already
+# been replaced by a newer push to the same branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run build
+      - name: Show checked-out revision
+        run: git rev-parse HEAD
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
