@@ -1,121 +1,65 @@
 # Throwit
 
-A production-oriented Next.js WebRTC application for direct file and text transfer between browsers. The UI is hosted on Vercel; payloads move peer-to-peer over encrypted WebRTC data channels and never pass through the Vercel or Supabase servers.
+A Snapdrop-style web app for throwing files and text directly between nearby browsers.
 
-## Architecture
+- **Frontend:** Next.js 16
+- **Discovery and signaling:** Vercel WebSockets
+- **Transfer:** encrypted WebRTC DataChannels
+- **Storage:** none; messages and files remain in browser memory
+- **Database:** none
+- **Supabase:** not used
+- **Room codes or network tokens:** not used
 
-```text
-Device A ── presence/signaling ── Supabase Realtime ── presence/signaling ── Device B
-    └──────────────── encrypted WebRTC DataChannel ────────────────────────┘
+## How discovery works
 
-Vercel Route Handlers:
-- /api/network: produces an opaque, rotating network-space token
-- /api/ice: provides STUN and optional short-lived TURN credentials
-```
+When a browser opens Throwit, the Vercel WebSocket route sees the request's public network address and places the connection into an internal, SHA-256-derived network group. The raw address is never sent to the browser. Devices sharing the same normal home or office NAT are shown automatically.
 
-### Automatic matching
+The server only relays WebRTC offers, answers, and ICE candidates. File bytes and text messages travel through the direct WebRTC channel.
 
-A normal web page cannot scan a LAN or enumerate devices. Throwit uses the best browser-compatible approximation: `/api/network` groups requests by their public IPv4 address or IPv6 `/64` prefix and converts that value into a rotating HMAC token. The raw IP address is never sent to the browser or Supabase.
+## Deploy to Vercel
 
-This works well for typical home/office NAT networks. It is not proof that devices are physically nearby: carrier-grade NAT, corporate proxies, VPNs, IPv4/IPv6 differences, or privacy relays can create false matches or prevent a match. The **Private space** control is the deterministic fallback.
+Import this repository into Vercel and deploy. No environment variables are required for a small single-instance deployment.
 
-## Features
-
-- Automatic same-network presence
-- Optional private connection code
-- Direct WebRTC file transfer with backpressure
-- 64 KiB chunking and progress updates
-- Text threads with copy action
-- Explicit acceptance before receiving a file
-- 512 MB browser-memory safety limit
-- Encrypted DTLS data channels
-- Rotating opaque network identifiers
-- Optional expiring TURN REST credentials
-- Responsive, accessible interface
-- TypeScript, ESLint, Vitest, and GitHub Actions CI
-
-## Local setup
-
-1. Create a Supabase project.
-2. Copy the Project URL and publishable key from the project Connect dialog or API settings.
-3. Copy the environment template:
+Vercel WebSocket connections can land on different Function instances when the app scales. For reliable production discovery across instances, add the Upstash Redis integration:
 
 ```bash
-cp .env.example .env.local
+vercel link
+vercel integration add upstash
 ```
 
-4. Fill in:
+The integration supplies `REDIS_URL` automatically. Redis contains only short-lived presence metadata and signaling events. It never receives files or chat content.
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
-NETWORK_TOKEN_SECRET=YOUR_LONG_RANDOM_SECRET
-```
+## Local development
 
-Generate the network secret with:
-
-```bash
-openssl rand -base64 48
-```
-
-5. Install and run:
+WebSocket upgrades use Vercel's runtime, so run:
 
 ```bash
 npm install
-npm run dev
+npx vercel dev
 ```
 
-Open the local URL on two devices. For testing across physical devices, use an HTTPS tunnel or deploy to Vercel because WebRTC and Clipboard APIs require a secure context outside `localhost`.
+Plain `next dev` renders the interface but does not provide the production WebSocket upgrade runtime.
 
-## Supabase configuration
+## What is implemented
 
-Throwit uses public Realtime Broadcast and Presence channels with unpredictable HMAC channel names. It does not create database tables and does not store chat messages, files, SDP records, or presence history.
+- Automatic device discovery for browsers seen from the same network
+- Device type and browser-generated name
+- Direct WebRTC connection on device selection
+- Text chat with clipboard copy
+- File offer with explicit accept or decline
+- Chunked file transfer with DataChannel backpressure
+- Transfer progress and downloadable received files
+- 512 MB in-memory safety limit
+- Reconnecting WebSocket client and peer cleanup
+- Server-side signaling rate limits and payload limits
+- Optional cross-instance Redis presence and relay
+- Responsive premium interface using the paper mascot as the only logo
 
-In Supabase, ensure Realtime is enabled. No SQL migration is required.
+## Browser and network realities
 
-For a higher-security deployment, replace public Realtime channels with authenticated private channels and issue short-lived Supabase JWTs from a server route.
+Browsers cannot scan arbitrary LAN devices directly. Like Snapdrop-style applications, Throwit requires a signaling rendezvous to tell browsers which peers exist and to exchange WebRTC connection descriptions.
 
-## Vercel deployment
-
-1. Push this directory to GitHub.
-2. Import the repository into Vercel.
-3. Add the variables from `.env.example` in **Project Settings → Environment Variables**.
-4. Deploy.
-
-The frontend and short Route Handlers are Vercel-native. Supabase provides the persistent realtime signaling connection, avoiding dependence on long-lived state inside a Vercel Function.
-
-## TURN for real-world reliability
-
-Same-LAN WebRTC often connects with STUN alone. Restricted corporate networks, symmetric NAT, guest Wi-Fi isolation, and some mobile paths require TURN.
-
-The included `/api/ice` route supports the coturn TURN REST API:
-
-```env
-TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp
-TURN_SHARED_SECRET=the-same-static-auth-secret-used-by-coturn
-TURN_TTL_SECONDS=3600
-```
-
-Configure coturn with `use-auth-secret` and the matching `static-auth-secret`. The browser receives expiring credentials rather than a permanent password embedded in the JavaScript bundle.
-
-## Production checklist
-
-- Configure TURN in at least two regions.
-- Enable Vercel WAF/rate limits for `/api/network` and `/api/ice`.
-- Use a paid Supabase plan sized for peak concurrent presence.
-- Set spending alerts on Vercel, Supabase, and TURN infrastructure.
-- Add Sentry or another error collector with payload redaction.
-- Test Chrome, Safari, Firefox, iOS, and Android on isolated guest Wi-Fi.
-- Add authenticated private channels before handling highly sensitive enterprise data.
-- Keep the file size limit conservative unless the receive path is changed to stream directly to disk.
-
-## Important browser limits
-
-- Browsers cannot reliably discover arbitrary LAN devices without a signaling rendezvous.
-- Automatic clipboard writes may require a user gesture and browser permission.
-- Received files are assembled in browser memory; the current build limits files to 512 MB.
-- Closing or background-suspending a mobile tab interrupts active transfers.
-- WebRTC encrypts transport, but a user must still trust the selected peer and signaling deployment.
+Devices can fail to appear together when they use different public routes, a VPN, iCloud Private Relay, carrier-grade NAT, isolated guest Wi-Fi, or incompatible IPv4/IPv6 paths. Restricted networks may also require a TURN relay; this version is optimized for normal same-network use and uses public STUN servers.
 
 ## Commands
 
@@ -123,6 +67,5 @@ Configure coturn with `use-auth-secret` and the matching `static-auth-secret`. T
 npm run dev
 npm run lint
 npm run typecheck
-npm test
 npm run build
 ```

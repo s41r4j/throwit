@@ -1,12 +1,21 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Throwit — local P2P sharing",
-  description: "Fast peer-to-peer file and text transfer between nearby devices.",
-  icons: { icon: "/paper-logo.webp" }
+  title: "Throwit — local peer-to-peer transfer",
+  description: "Throw files and text directly to nearby devices.",
+  applicationName: "Throwit",
+};
+
+export const viewport: Viewport = {
+  themeColor: "#f3f1ec",
+  colorScheme: "light",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
 }
