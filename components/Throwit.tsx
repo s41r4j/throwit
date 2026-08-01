@@ -5,11 +5,6 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 
 type Device = { id: string; name: string; kind: "desktop" | "mobile" | "tablet" | "unknown" };
 type Signal = { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit };
-type ServerMessage =
-  | { type: "peers"; peers: Device[] }
-  | { type: "signal"; from: string; signal: Signal }
-  | { type: "ready" }
-  | { type: "pong" };
 type Wire =
   | { type: "text"; id: string; text: string }
   | { type: "file"; id: string; name: string; size: number; mime: string }
@@ -22,29 +17,33 @@ type Incoming = Offer & { chunks: ArrayBuffer[]; received: number };
 const CHUNK = 64 * 1024;
 const LIMIT = 512 * 1024 * 1024;
 const uid = () => crypto.randomUUID().replaceAll("-", "");
-const bytes = (n: number) => n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`;
+const bytes = (n: number) => n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.ceil(n / 1024))} KB`;
 
 function identity(): Device {
   const ua = navigator.userAgent;
   const kind = /iPad|Tablet/i.test(ua) ? "tablet" : /iPhone|Android|Mobile/i.test(ua) ? "mobile" : "desktop";
   const browser = ua.includes("Edg/") ? "Edge" : ua.includes("Firefox/") ? "Firefox" : ua.includes("Chrome/") ? "Chrome" : ua.includes("Safari/") ? "Safari" : "Browser";
-  const platform = /iPhone|iPad/i.test(ua) ? "iPhone" : /Android/i.test(ua) ? "Android" : /Macintosh/i.test(ua) ? "Mac" : /Windows/i.test(ua) ? "Windows" : "Device";
-  return { id: uid(), name: `${browser} on ${platform}`, kind };
+  const platform = /iPhone/i.test(ua) ? "iPhone" : /iPad/i.test(ua) ? "iPad" : /Android/i.test(ua) ? "Android" : /Macintosh/i.test(ua) ? "Mac" : /Windows/i.test(ua) ? "Windows" : "Device";
+  const saved = sessionStorage.getItem("throwit-peer-id") || uid();
+  sessionStorage.setItem("throwit-peer-id", saved);
+  return { id: saved, name: `${browser} on ${platform}`, kind };
 }
 
 export default function Throwit() {
   const [self, setSelf] = useState<Device | null>(null);
   const [peers, setPeers] = useState<Device[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [status, setStatus] = useState("Connecting");
+  const [status, setStatus] = useState("Preparing local airspace");
+  const [mode, setMode] = useState<"file" | "text">("file");
   const [text, setText] = useState("");
   const [chat, setChat] = useState<Chat[]>([]);
   const [offer, setOffer] = useState<Offer | null>(null);
   const [progress, setProgress] = useState<{ name: string; value: number } | null>(null);
   const [files, setFiles] = useState<Array<{ id: string; peer: string; name: string; url: string; size: number }>>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const [flying, setFlying] = useState(false);
+  const [loadedFile, setLoadedFile] = useState<File | null>(null);
 
-  const socket = useRef<WebSocket | null>(null);
   const pcs = useRef(new Map<string, RTCPeerConnection>());
   const channels = useRef(new Map<string, RTCDataChannel>());
   const pendingIce = useRef(new Map<string, RTCIceCandidateInit[]>());
@@ -55,15 +54,21 @@ export default function Throwit() {
   const chosen = useMemo(() => peers.find((p) => p.id === selected) || null, [peers, selected]);
   const thread = chat.filter((m) => m.peer === selected);
   const received = files.filter((f) => f.peer === selected);
+  const selectedIndex = Math.max(0, peers.findIndex((peer) => peer.id === selected));
 
   const toast = useCallback((message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice((value) => value === message ? null : value), 2600);
   }, []);
 
-  const signal = useCallback((to: string, payload: Signal) => {
-    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ type: "signal", to, signal: payload }));
-  }, []);
+  const signal = useCallback(async (to: string, payload: Signal) => {
+    if (!self) return;
+    await fetch("/api/signal", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: self.id, to, signal: payload }),
+    });
+  }, [self]);
 
   const closePeer = useCallback((id: string) => {
     channels.current.get(id)?.close();
@@ -79,32 +84,50 @@ export default function Throwit() {
     channel.send(JSON.stringify(data));
   }, []);
 
-  const waitChannel = useCallback(async (peer: string) => {
-    const current = channels.current.get(peer);
-    if (current?.readyState === "open") return current;
-    connect(peer, true);
-    return new Promise<RTCDataChannel>((resolve, reject) => {
-      const started = Date.now();
-      const timer = window.setInterval(() => {
-        const channel = channels.current.get(peer);
-        if (channel?.readyState === "open") { clearInterval(timer); resolve(channel); }
-        else if (Date.now() - started > 12000) { clearInterval(timer); reject(new Error("timeout")); }
-      }, 120);
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const bind = useCallback((peer: string, channel: RTCDataChannel) => {
+    channel.binaryType = "arraybuffer";
+    channels.current.set(peer, channel);
+    channel.onopen = () => setStatus("Direct encrypted route ready");
+    channel.onclose = () => channels.current.delete(peer);
   }, []);
 
-  const sendFileBytes = useCallback(async (peer: string, id: string, file: File) => {
-    const channel = await waitChannel(peer);
-    setProgress({ name: file.name, value: 0 });
-    for (let offset = 0; offset < file.size; offset += CHUNK) {
-      while (channel.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
-      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
-      setProgress({ name: file.name, value: Math.round(Math.min(file.size, offset + CHUNK) / file.size * 100) });
+  const connect = useCallback((peer: string, initiator: boolean) => {
+    if (pcs.current.has(peer)) return pcs.current.get(peer)!;
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }] });
+    pcs.current.set(peer, pc);
+    pc.onicecandidate = ({ candidate }) => candidate && void signal(peer, { candidate: candidate.toJSON() });
+    pc.ondatachannel = ({ channel }) => bind(peer, channel);
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") setStatus("Direct encrypted route ready");
+      if (["failed", "closed"].includes(pc.connectionState)) closePeer(peer);
+    };
+    if (initiator) {
+      bind(peer, pc.createDataChannel("throwit", { ordered: true }));
+      void pc.createOffer().then(async (description) => {
+        await pc.setLocalDescription(description);
+        await signal(peer, { description: pc.localDescription! });
+      });
     }
-    sendWire(peer, { type: "end", id });
-    window.setTimeout(() => setProgress(null), 800);
-  }, [sendWire, waitChannel]);
+    return pc;
+  }, [bind, closePeer, signal]);
+
+  const receiveSignal = useCallback(async (from: string, payload: Signal) => {
+    const pc = connect(from, false);
+    if (payload.description) {
+      await pc.setRemoteDescription(payload.description);
+      for (const candidate of pendingIce.current.get(from) || []) await pc.addIceCandidate(candidate);
+      pendingIce.current.delete(from);
+      if (payload.description.type === "offer") {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await signal(from, { description: pc.localDescription! });
+      }
+    }
+    if (payload.candidate) {
+      if (pc.remoteDescription) await pc.addIceCandidate(payload.candidate);
+      else pendingIce.current.set(from, [...(pendingIce.current.get(from) || []), payload.candidate]);
+    }
+  }, [connect, signal]);
 
   const handleData = useCallback((peer: string, event: MessageEvent) => {
     if (event.data instanceof ArrayBuffer) {
@@ -135,118 +158,136 @@ export default function Throwit() {
       setProgress(null);
       toast(`${item.name} was caught.`);
     }
-  }, [sendFileBytes, toast]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toast]);
 
-  const bind = useCallback((peer: string, channel: RTCDataChannel) => {
-    channel.binaryType = "arraybuffer";
-    channels.current.set(peer, channel);
-    channel.onmessage = (event) => handleData(peer, event);
-    channel.onopen = () => setStatus("Direct connection ready");
-    channel.onclose = () => channels.current.delete(peer);
+  useEffect(() => {
+    channels.current.forEach((channel, peer) => { channel.onmessage = (event) => handleData(peer, event); });
   }, [handleData]);
 
-  const connect = useCallback((peer: string, initiator: boolean) => {
-    if (pcs.current.has(peer)) return pcs.current.get(peer)!;
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }] });
-    pcs.current.set(peer, pc);
-    pc.onicecandidate = ({ candidate }) => candidate && signal(peer, { candidate: candidate.toJSON() });
-    pc.ondatachannel = ({ channel }) => bind(peer, channel);
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "connected") setStatus("Direct connection ready");
-      if (["failed", "closed"].includes(pc.connectionState)) closePeer(peer);
-    };
-    if (initiator) {
-      bind(peer, pc.createDataChannel("throwit", { ordered: true }));
-      void pc.createOffer().then(async (description) => { await pc.setLocalDescription(description); signal(peer, { description: pc.localDescription! }); });
-    }
-    return pc;
-  }, [bind, closePeer, signal]);
+  const waitChannel = useCallback(async (peer: string) => {
+    const current = channels.current.get(peer);
+    if (current?.readyState === "open") return current;
+    connect(peer, true);
+    return new Promise<RTCDataChannel>((resolve, reject) => {
+      const started = Date.now();
+      const timer = window.setInterval(() => {
+        const channel = channels.current.get(peer);
+        if (channel?.readyState === "open") { clearInterval(timer); resolve(channel); }
+        else if (Date.now() - started > 15000) { clearInterval(timer); reject(new Error("timeout")); }
+      }, 120);
+    });
+  }, [connect]);
 
-  const receiveSignal = useCallback(async (from: string, payload: Signal) => {
-    const pc = connect(from, false);
-    if (payload.description) {
-      await pc.setRemoteDescription(payload.description);
-      for (const candidate of pendingIce.current.get(from) || []) await pc.addIceCandidate(candidate);
-      pendingIce.current.delete(from);
-      if (payload.description.type === "offer") {
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        signal(from, { description: pc.localDescription! });
-      }
+  const sendFileBytes = useCallback(async (peer: string, id: string, file: File) => {
+    const channel = await waitChannel(peer);
+    setProgress({ name: file.name, value: 0 });
+    for (let offset = 0; offset < file.size; offset += CHUNK) {
+      while (channel.bufferedAmount > 4 * 1024 * 1024) await new Promise((resolve) => setTimeout(resolve, 25));
+      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
+      setProgress({ name: file.name, value: Math.round(Math.min(file.size, offset + CHUNK) / file.size * 100) });
     }
-    if (payload.candidate) {
-      if (pc.remoteDescription) await pc.addIceCandidate(payload.candidate);
-      else pendingIce.current.set(from, [...(pendingIce.current.get(from) || []), payload.candidate]);
-    }
-  }, [connect, signal]);
+    sendWire(peer, { type: "end", id });
+    window.setTimeout(() => setProgress(null), 900);
+  }, [sendWire, waitChannel]);
 
   useEffect(() => {
     const me = identity();
     setSelf(me);
     let stopped = false;
-    let retry = 500;
-    let ping: number | undefined;
-    const open = () => {
-      if (stopped) return;
-      setStatus("Connecting");
-      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(process.env.NEXT_PUBLIC_SIGNALING_URL || `${protocol}//${location.host}/api/ws`);
-      socket.current = ws;
-      ws.onopen = () => {
-        retry = 500;
-        setStatus("Looking for nearby devices");
-        ws.send(JSON.stringify({ type: "hello", peer: me }));
-        ping = window.setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: "ping" })), 20000);
-      };
-      ws.onmessage = (event) => {
-        let message: ServerMessage;
-        try { message = JSON.parse(event.data) as ServerMessage; } catch { return; }
-        if (message.type === "peers") {
-          setPeers(message.peers);
-          setStatus(message.peers.length ? "Nearby devices found" : "Waiting for another device");
-          setSelected((current) => current && message.peers.some((p) => p.id === current) ? current : message.peers[0]?.id || null);
+    let presenceTimer: number | undefined;
+    let signalTimer: number | undefined;
+
+    const presence = async () => {
+      try {
+        const response = await fetch("/api/presence", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(me),
+          cache: "no-store",
+        });
+        const result = await response.json() as { peers?: Device[]; error?: string };
+        if (!response.ok) throw new Error(result.error || "Discovery unavailable");
+        const next = result.peers || [];
+        if (!stopped) {
+          setPeers(next);
+          setSelected((current) => current && next.some((peer) => peer.id === current) ? current : next[0]?.id || null);
+          setStatus(next.length ? `${next.length} nearby device${next.length === 1 ? "" : "s"} found` : "Waiting for another device");
         }
-        if (message.type === "signal") void receiveSignal(message.from, message.signal);
-      };
-      ws.onclose = () => {
-        if (ping) clearInterval(ping);
-        if (!stopped) { setStatus("Reconnecting"); window.setTimeout(open, retry); retry = Math.min(retry * 2, 8000); }
-      };
+      } catch (error) {
+        if (!stopped) setStatus(error instanceof Error ? error.message : "Discovery unavailable");
+      }
     };
-    open();
+
+    const pollSignals = async () => {
+      try {
+        const response = await fetch(`/api/signal?peer=${encodeURIComponent(me.id)}`, { cache: "no-store" });
+        const result = await response.json() as { signals?: Array<{ from: string; signal: Signal }> };
+        for (const item of result.signals || []) await receiveSignal(item.from, item.signal);
+      } catch {
+        // Presence status communicates configuration failures.
+      }
+    };
+
+    void presence();
+    void pollSignals();
+    presenceTimer = window.setInterval(() => void presence(), 2800);
+    signalTimer = window.setInterval(() => void pollSignals(), 650);
     return () => {
       stopped = true;
-      if (ping) clearInterval(ping);
-      socket.current?.close();
+      if (presenceTimer) clearInterval(presenceTimer);
+      if (signalTimer) clearInterval(signalTimer);
       pcs.current.forEach((pc) => pc.close());
       files.forEach((file) => URL.revokeObjectURL(file.url));
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiveSignal]);
 
+  useEffect(() => {
+    const handler = (event: MessageEvent) => handleData(selected || "", event);
+    const channel = selected ? channels.current.get(selected) : null;
+    if (channel) channel.onmessage = handler;
+  }, [handleData, selected]);
+
   async function sendText(event: FormEvent) {
     event.preventDefault();
     const value = text.trim();
     if (!chosen || !value) return;
     try {
-      await waitChannel(chosen.id);
+      const channel = await waitChannel(chosen.id);
+      channel.onmessage = (message) => handleData(chosen.id, message);
       const id = uid();
       sendWire(chosen.id, { type: "text", id, text: value.slice(0, 20000) });
       setChat((items) => [...items, { id, peer: chosen.id, mine: true, text: value }]);
       setText("");
+      animateThrow();
     } catch { toast("Could not reach that device."); }
   }
 
-  async function chooseFile(file?: File) {
-    if (!file || !chosen) return;
+  async function prepareFile(file?: File) {
+    if (!file) return;
     if (file.size > LIMIT) return toast("Files are limited to 512 MB.");
+    setLoadedFile(file);
+    setMode("file");
+  }
+
+  async function throwFile() {
+    if (!loadedFile || !chosen) return;
     try {
-      await waitChannel(chosen.id);
+      const channel = await waitChannel(chosen.id);
+      channel.onmessage = (message) => handleData(chosen.id, message);
       const id = uid();
-      outgoing.current.set(id, { peer: chosen.id, file });
-      sendWire(chosen.id, { type: "file", id, name: file.name, size: file.size, mime: file.type || "application/octet-stream" });
+      outgoing.current.set(id, { peer: chosen.id, file: loadedFile });
+      sendWire(chosen.id, { type: "file", id, name: loadedFile.name, size: loadedFile.size, mime: loadedFile.type || "application/octet-stream" });
+      animateThrow();
       toast(`Waiting for ${chosen.name} to catch it.`);
     } catch { toast("Could not prepare the direct route."); }
+  }
+
+  function animateThrow() {
+    setFlying(false);
+    requestAnimationFrame(() => setFlying(true));
+    window.setTimeout(() => setFlying(false), 1150);
   }
 
   function answer(accepted: boolean) {
@@ -258,32 +299,38 @@ export default function Throwit() {
 
   return <main className="app">
     <header className="nav">
-      <div className="brand"><Image src="/paper-logo.webp" width={46} height={46} alt="Throwit paper mascot" priority /><span>throwit</span></div>
-      <div className="state"><i /><span>{status}</span></div>
+      <div className="brand"><Image src="/paper-logo.webp" width={44} height={44} alt="Throwit paper mascot" priority /><span>throwit</span></div>
+      <div className="secure"><i /><span>{status}</span></div>
     </header>
 
-    <section className="layout">
-      <div className="intro"><small>LOCAL PEER-TO-PEER TRANSFER</small><h1>Don&apos;t upload it.<br /><em>Throw it.</em></h1><p>Fast file sharing and temporary text chat, directly between nearby browsers.</p></div>
+    <section className="canvas">
+      <div className="intro"><small>LOCAL AIRSPACE</small><h1>Don&apos;t upload it.<br /><em>Throw it.</em></h1><p>Choose a nearby browser and throw files or temporary text directly to it.</p></div>
 
-      <section className="airspace">
-        <div className="orbit one" /><div className="orbit two" />
-        <div className="center"><Image src="/paper-logo.webp" width={210} height={210} alt="" priority /><strong>{self?.name || "This device"}</strong><span>{peers.length ? "Choose where to throw" : "Open Throwit on another device"}</span></div>
-        <div className="peers">{peers.slice(0, 6).map((peer, index) => <button key={peer.id} className={`peer p${index + 1} ${selected === peer.id ? "active" : ""}`} onClick={() => { setSelected(peer.id); connect(peer.id, true); }}><span>{peer.kind === "mobile" ? "▯" : "▭"}</span><div><strong>{peer.name}</strong><small>available</small></div></button>)}</div>
-        {!peers.length && <div className="searching"><i /><strong>Looking for devices</strong><p>Use the same Wi-Fi or network.</p></div>}
+      <section className={`radar selected-${selectedIndex + 1}`}>
+        <div className="orbit o1" /><div className="orbit o2" /><div className="orbit o3" />
+        {chosen && <div className="beam" />}
+        <div className={`paper-core ${flying ? "launch" : ""}`}><Image src="/paper-logo.webp" width={190} height={190} alt="" priority /></div>
+        <div className="core-copy"><strong>{peers.length ? "Ready to throw" : "Ready to catch your payload"}</strong><span>{peers.length ? `aimed at ${chosen?.name || "a nearby device"}` : "open Throwit on another device"}</span></div>
+        <div className="peers">{peers.slice(0, 6).map((peer, index) => <button key={peer.id} className={`peer p${index + 1} ${selected === peer.id ? "active" : ""}`} onClick={() => { setSelected(peer.id); connect(peer.id, true); }}><span className="device-icon">{peer.kind === "mobile" ? "▯" : peer.kind === "tablet" ? "▰" : "▭"}</span><span className="peer-copy"><strong>{peer.name}</strong><small>{selected === peer.id ? "selected" : "available"}</small></span></button>)}</div>
+        {!peers.length && <div className="searching"><i /><span>{status}</span></div>}
       </section>
 
-      <aside className="panel">
-        <div className="panel-title"><small>THROWING TO</small><h2>{chosen?.name || "No device selected"}</h2></div>
-        <button className="drop" disabled={!chosen} onClick={() => input.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); void chooseFile(e.dataTransfer.files[0]); }}><span>↑</span><div><strong>Throw a file</strong><small>Choose or drop it here</small></div></button>
-        <input ref={input} hidden type="file" onChange={(e) => { void chooseFile(e.target.files?.[0]); e.target.value = ""; }} />
-        <div className="thread">{!chosen && <p className="empty">Select a device to begin.</p>}{chosen && !thread.length && !received.length && <p className="empty">Send text like a private temporary chat.</p>}{thread.map((item) => <article key={item.id} className={item.mine ? "bubble mine" : "bubble"}><p>{item.text}</p><button onClick={() => navigator.clipboard.writeText(item.text)}>Copy</button></article>)}{received.map((file) => <article className="file" key={file.id}><span>↓</span><div><strong>{file.name}</strong><small>{bytes(file.size)}</small></div><a href={file.url} download={file.name}>Save</a></article>)}</div>
-        <form className="compose" onSubmit={sendText}><textarea value={text} onChange={(e) => setText(e.target.value)} disabled={!chosen} placeholder={chosen ? "Write or paste something…" : "Choose a device first"} /><button disabled={!chosen || !text.trim()}>➤</button></form>
-      </aside>
+      <section className={`dock ${mode === "text" ? "text-open" : ""}`}>
+        <div className="tabs"><button className={mode === "file" ? "active" : ""} onClick={() => setMode("file")}>File</button><button className={mode === "text" ? "active" : ""} onClick={() => setMode("text")}>Text</button></div>
+        {mode === "file" ? <>
+          <button className="payload" onClick={() => input.current?.click()} disabled={!chosen}><span>{loadedFile ? "↑" : "+"}</span><div><strong>{loadedFile?.name || "Choose a file"}</strong><small>{loadedFile ? bytes(loadedFile.size) : chosen ? `to ${chosen.name}` : "select a device first"}</small></div></button>
+          <input ref={input} hidden type="file" onChange={(event) => { void prepareFile(event.target.files?.[0]); event.target.value = ""; }} />
+          <button className="throw" disabled={!chosen || !loadedFile} onClick={() => void throwFile()}><span>→</span><strong>throw it</strong></button>
+        </> : <div className="text-dock">
+          <div className="thread">{!thread.length && !received.length && <p>Temporary chat with {chosen?.name || "a selected device"}.</p>}{thread.map((item) => <article key={item.id} className={item.mine ? "mine" : ""}>{item.text}<button onClick={() => navigator.clipboard.writeText(item.text)}>copy</button></article>)}{received.map((file) => <article key={file.id} className="received"><span>↓</span><div><strong>{file.name}</strong><small>{bytes(file.size)}</small></div><a href={file.url} download={file.name}>save</a></article>)}</div>
+          <form onSubmit={sendText}><textarea value={text} onChange={(event) => setText(event.target.value)} disabled={!chosen} placeholder={chosen ? "Write or paste something…" : "Choose a device first"} /><button disabled={!chosen || !text.trim()}>→</button></form>
+        </div>}
+      </section>
     </section>
 
     <footer><span>Encrypted by WebRTC</span><span>Files never touch the server</span></footer>
     {progress && <div className="progress"><div><strong>{progress.name}</strong><span>{progress.value}%</span></div><i><b style={{ width: `${progress.value}%` }} /></i></div>}
-    {offer && <div className="modal"><section><Image src="/paper-logo.webp" width={92} height={92} alt="" /><small>INCOMING THROW</small><h2>Catch {offer.name}?</h2><p>{bytes(offer.size)}</p><div><button onClick={() => answer(false)}>Decline</button><button className="accept" onClick={() => answer(true)}>Catch it</button></div></section></div>}
+    {offer && <div className="modal"><section><Image src="/paper-logo.webp" width={94} height={94} alt="" /><small>INCOMING THROW</small><h2>Catch {offer.name}?</h2><p>{bytes(offer.size)}</p><div><button onClick={() => answer(false)}>Decline</button><button className="accept" onClick={() => answer(true)}>Catch it</button></div></section></div>}
     {notice && <div className="toast">{notice}</div>}
   </main>;
 }

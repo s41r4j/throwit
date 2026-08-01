@@ -1,10 +1,8 @@
 {
   "name": "throwit",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "engines": {
-    "node": "22.x"
-  },
+  "engines": { "node": "22.x" },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -13,12 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vercel/functions": "^3.7.6",
-    "ioredis": "^5.11.1",
+    "@upstash/redis": "^1.35.3",
     "next": "16.2.12",
     "react": "19.2.0",
-    "react-dom": "19.2.0",
-    "ws": "^8.21.1"
+    "react-dom": "19.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
@@ -26,7 +22,6 @@
     "@types/react-dom": "^19.1.0",
     "eslint": "^9.22.0",
     "eslint-config-next": "16.2.12",
-    "typescript": "^5.8.2",
-    "@types/ws": "^8.18.1"
+    "typescript": "^5.8.2"
   }
 }
