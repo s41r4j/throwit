@@ -1,0 +1,58 @@
+/* Targeted responsive fixes layered after globals.css. */
+
+/* Keep the conversation action understandable on tablet/compact desktop. */
+@media (max-width: 1120px) and (min-width: 901px) {
+  .conversation-toggle span { display: inline; }
+  .conversation-toggle { padding: 0 12px; }
+}
+
+/* Avoid clipping the orbit/device labels when the conversation panel opens. */
+@media (min-width: 901px) {
+  .panel-open .radar { width: min(590px, 64vw); }
+}
+
+/* Short laptop windows were forcing a 690px canvas and clipping the footer/UI. */
+@media (min-width: 901px) and (max-height: 820px) {
+  .canvas { min-height: 560px; }
+  .radar { top: 53%; width: min(560px, 68vw); }
+  .intro { top: 22px; }
+  .intro h1 { font-size: clamp(40px, 4.3vw, 58px); }
+}
+
+@media (max-width: 900px) {
+  .app { min-height: 100dvh; }
+  .conversation-panel {
+    bottom: max(8px, env(safe-area-inset-bottom));
+  }
+  .composer textarea { resize: none; }
+}
+
+@media (max-width: 620px) {
+  .nav-actions { gap: 6px; }
+  .conversation-toggle,
+  .network-toggle,
+  .share-link { min-width: 0; }
+  .nav-center { max-width: calc(100vw - 78px); }
+
+  /* The previous fixed 520px radar overflowed 320–390px phones. */
+  .radar {
+    width: min(520px, 132vw);
+    left: 50%;
+  }
+
+  .peer { min-width: 104px; }
+  .peer-copy strong,
+  .peer-copy small { max-width: 76px; }
+
+  .conversation-panel {
+    inset-inline: 5px;
+    top: 110px;
+  }
+}
+
+@media (max-width: 380px) {
+  .share-link { font-size: 10px; padding-inline: 8px; }
+  .network-toggle { gap: 6px; padding-left: 6px; padding-right: 8px; }
+  .conversation-toggle { padding-inline: 9px; }
+  .radar { width: 136vw; }
+}

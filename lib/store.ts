@@ -36,16 +36,58 @@ function cleanSpace(space?: string | null) {
   return SPACE_PATTERN.test(value) ? value : null;
 }
 
-function normalizeAddress(raw: string) {
+function stripAddressDecorations(raw: string) {
   let value = raw.trim().toLowerCase();
-  const bracketed = value.match(/^\[([0-9a-f:]+)](?::\d+)?$/i);
+  const bracketed = value.match(/^\[([0-9a-f:.]+)](?::\d+)?$/i);
   if (bracketed) value = bracketed[1];
   if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(value)) {
     value = value.slice(0, value.lastIndexOf(":"));
   }
   if (value.startsWith("::ffff:")) value = value.slice(7);
-  if (value.includes(":")) return value.split(":").slice(0, 4).join(":");
+  const zoneIndex = value.indexOf("%");
+  if (zoneIndex !== -1) value = value.slice(0, zoneIndex);
   return value;
+}
+
+function expandIpv6(value: string) {
+  const [leftRaw, rightRaw = ""] = value.split("::", 2);
+  const left = leftRaw ? leftRaw.split(":").filter(Boolean) : [];
+  const right = rightRaw ? rightRaw.split(":").filter(Boolean) : [];
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (!value.includes("::") && missing !== 0)) return null;
+  const groups = [...left, ...Array(Math.max(0, missing)).fill("0"), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+  return groups.map((group) => group.padStart(4, "0"));
+}
+
+function normalizeAddress(raw: string) {
+  const value = stripAddressDecorations(raw);
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return value;
+
+  if (value.includes(":")) {
+    const groups = expandIpv6(value);
+    if (groups) {
+      // Group IPv6 clients by /64. This avoids treating devices on the same
+      // Wi-Fi/hotspot prefix as different networks just because interface IDs differ.
+      return `${groups.slice(0, 4).join(":")}::/64`;
+    }
+  }
+
+  return value || "unknown";
+}
+
+function clientAddress(headers: Headers) {
+  const candidates = [
+    headers.get("x-vercel-forwarded-for"),
+    headers.get("x-forwarded-for"),
+    headers.get("x-real-ip"),
+  ];
+
+  for (const candidate of candidates) {
+    const first = candidate?.split(",")[0]?.trim();
+    if (first) return normalizeAddress(first);
+  }
+  return "local-development";
 }
 
 function networkScope(headers: Headers, space?: string | null) {
@@ -57,15 +99,8 @@ function networkScope(headers: Headers, space?: string | null) {
       .slice(0, 28);
   }
 
-  const forwarded =
-    headers.get("x-vercel-forwarded-for") ||
-    headers.get("x-forwarded-for") ||
-    headers.get("x-real-ip") ||
-    "local-development";
-  const first = forwarded.split(",")[0]?.trim() || "local-development";
-  const normalized = normalizeAddress(first);
   return createHash("sha256")
-    .update(`throwit:network:${normalized}`)
+    .update(`throwit:network:${clientAddress(headers)}`)
     .digest("hex")
     .slice(0, 28);
 }
